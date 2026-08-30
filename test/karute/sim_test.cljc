@@ -1,0 +1,58 @@
+(ns karute.sim-test
+  "The demo's own floor. `karute.sim/audit` is what makes
+  `clojure -M:sim` exit non-zero rather than print cheerfully, so it is
+  itself something that has to be shown to discriminate."
+  (:require [clojure.test :refer [deftest is testing]]
+            [karute.governor :as gov]
+            [karute.sim :as sim]))
+
+(deftest the-demo-refuses-and-commits-and-verifies
+  (let [{:keys [ok? problems summary]} (sim/audit (sim/run-all))]
+    (is ok? (str "sim/audit reported: " problems))
+    (is (pos? (:refused summary)))
+    (is (pos? (:committed summary)))
+    (is (:ok? (:chain summary)))))
+
+(deftest the-demo-exercises-every-hard-rule
+  (testing "each rule fires at least once in the walk, so no check in
+            the governor is unreachable from the demo"
+    (let [fired (into #{} (mapcat :basis) (:ledger (sim/run-all)))]
+      (is (empty? (remove fired gov/all-hard-rules))
+          (str "never fired: " (vec (sort (remove fired gov/all-hard-rules))))))))
+
+(deftest the-floor-rejects-a-run-that-refused-nothing
+  (testing "the property that makes the floor worth having: a ledger
+            with no holds must NOT be reported as a pass"
+    (let [no-holds {:ledger (filterv #(not= :hold (:disposition %))
+                                     (:ledger (sim/run-all)))}
+          r (sim/audit no-holds)]
+      (is (false? (:ok? r)))
+      (is (some #(re-find #"拒否" %) (:problems r))))))
+
+(deftest the-floor-rejects-a-run-that-committed-nothing
+  (let [no-commits {:ledger (filterv #(not= :commit (:disposition %))
+                                     (:ledger (sim/run-all)))}
+        r (sim/audit no-commits)]
+    (is (false? (:ok? r)))
+    (is (some #(re-find #"commit" %) (:problems r)))))
+
+(deftest the-floor-rejects-a-tampered-chain
+  (let [l (:ledger (sim/run-all))
+        r (sim/audit {:ledger (assoc-in l [0 :disposition] :commit)})]
+    (is (false? (:ok? r)))
+    (is (some #(re-find #"チェーン" %) (:problems r)))))
+
+(deftest the-floor-rejects-a-run-that-skipped-a-check
+  (testing "drop every entry that named one rule -- the floor must
+            notice that rule was never demonstrated"
+    (let [l (:ledger (sim/run-all))
+          without (filterv #(not (some #{:consent-revoked} (:basis %))) l)
+          r (sim/audit {:ledger without})]
+      (is (false? (:ok? r)))
+      (is (some #(re-find #"consent-revoked" %) (:problems r))))))
+
+(deftest the-floor-passes-the-unmodified-run
+  (testing "stated separately from the first test so that the four
+            negative cases above are known to be rejecting for their own
+            reasons and not because audit rejects everything"
+    (is (:ok? (sim/audit (sim/run-all))))))

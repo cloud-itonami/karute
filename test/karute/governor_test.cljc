@@ -1,0 +1,209 @@
+(ns karute.governor-test
+  "Each HARD check, provoked ON ITS OWN and asserted BY NAME.
+
+  Two disciplines are load-bearing here and neither is decoration:
+
+  1. Every case asserts the specific rule keyword, never merely that
+     something was refused. A test that only asserts `(not ok?)` counts
+     a run that failed for an unrelated reason as a demonstration --
+     and this suite has fifteen ways to fail for an unrelated reason,
+     because every case shares one fixture.
+
+  2. Every case that provokes a violation has a sibling that does NOT,
+     differing in the one field the rule is about. A check that fires on
+     everything is as useless as one that fires on nothing, and only
+     the pair can tell them apart."
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing]]
+            [karute.governor :as gov]
+            [karute.store :as store]))
+
+(def st (store/seed-db))
+(def ctx {:actor-id "dr-a" :phase 3})
+(def now "2026-06-01T00:00:00Z")
+
+(def clean
+  {:op :disclosure/second-opinion
+   :subject "did:plc:patient-a"
+   :recipient-did "did:web:clinic-b.example"
+   :capability-uri "at://consent/cap-clean"
+   :scope #{:soap-note :observation :condition}
+   :now now
+   :home-jurisdiction "JPN"})
+
+(defn rules
+  "The set of rule keywords the governor raises for a request."
+  ([req] (rules req st))
+  ([req db] (into #{} (map :rule) (:violations (gov/check req ctx {:confidence 0.95} db)))))
+
+;; ------------------------------------------------------------------
+;; The table. `:req` is a patch onto `clean`; `:rule` is what that patch
+;; must provoke. `all-hard-rules-are-exercised` below turns this table
+;; into the proof that no rule is unreachable.
+;; ------------------------------------------------------------------
+
+(def cases
+  [{:rule :consent-missing              :why "no capability cited"
+    :req {:capability-uri nil}}
+   {:rule :consent-not-found            :why "cited URI absent from the store"
+    :req {:capability-uri "at://consent/does-not-exist"}}
+   {:rule :consent-granter-mismatch     :why "patient B's consent used to export patient A"
+    :req {:capability-uri "at://consent/cap-other-patient"}}
+   {:rule :consent-grantee-mismatch     :why "sent to someone the patient did not name"
+    :req {:recipient-did "did:web:elsewhere.example"}}
+   {:rule :consent-revoked              :why "capability revoked"
+    :req {:capability-uri "at://consent/cap-revoked" :scope #{:soap-note}}}
+   {:rule :consent-expired              :why "now is past expires-at"
+    :req {:capability-uri "at://consent/cap-expired" :scope #{:soap-note}}}
+   {:rule :consent-not-yet-valid        :why "now is before issued-at"
+    :req {:now "2025-12-01T00:00:00Z"}}
+   {:rule :consent-window-unevaluable   :why "now is not a well-formed instant"
+    :req {:now "2026-6-1"}}
+   {:rule :purpose-not-bound            :why "billing consent used for a second opinion"
+    :req {:capability-uri "at://consent/cap-billing"
+          :recipient-did "did:web:iryo.etzhayyim.com" :scope #{:encounter}}}
+   {:rule :scope-exceeds-consent        :why "a kind outside the granted scope"
+    :req {:capability-uri "at://consent/cap-expired" :now "2025-03-01T00:00:00Z"
+          :scope #{:soap-note :medication-request}}}
+   {:rule :scope-unknown-kind           :why "a kind this actor does not hold"
+    :req {:scope #{:horoscope}}}
+   {:rule :scope-empty                  :why "no scope at all"
+    :req {:scope #{}}}
+   {:rule :delegation-depth-exceeded    :why "re-delegated further than the patient allowed"
+    :req {:capability-uri "at://consent/cap-deep-delegation" :scope #{:soap-note}}}
+   {:rule :legal-basis-missing          :why "recipient jurisdiction absent from the facts catalog"
+    :req {:capability-uri "at://consent/cap-uncatalogued"
+          :recipient-did "did:web:clinic-y.example" :scope #{:soap-note}}}
+   {:rule :cross-border-without-basis   :why "catalogued jurisdiction, no adequacy and no safeguard"
+    :req {:capability-uri "at://consent/cap-cross-border"
+          :recipient-did "did:web:clinic-x.example" :scope #{:soap-note}}}
+   {:rule :double-disclosure           :why "the same disclosure attempted twice"
+    :db (store/record-disclosure (store/seed-db) :disclosure/second-opinion
+                                 "did:plc:patient-a" "did:web:clinic-b.example"
+                                 "at://consent/cap-clean")
+    :req {}}
+   {:rule :public-meta-not-allowlisted  :why "a name and a diagnosis in the public half"
+    :req {:op :record/write :record-id "r" :kind :soap-note
+          :public-meta {:patient-did "did:plc:patient-a" :name "山田 太郎" :diagnosis "J18.9"}}}])
+
+(deftest a-clean-disclosure-raises-no-violation
+  (testing "the fixture the whole table patches must itself be clean, or
+            every case below could be passing for the wrong reason"
+    (is (= #{} (rules clean)))))
+
+(deftest each-check-fires-for-its-own-reason
+  (doseq [{:keys [rule req why db]} cases]
+    (testing (str (name rule) " -- " why)
+      (is (contains? (rules (merge clean req) (or db st)) rule)
+          (str "expected " rule " for: " why)))))
+
+(deftest each-check-is-silent-when-its-own-condition-is-absent
+  (testing "removing only the offending field clears only that rule"
+    (is (not (contains? (rules clean) :consent-granter-mismatch)))
+    (is (not (contains? (rules clean) :consent-expired)))
+    (is (not (contains? (rules clean) :scope-exceeds-consent)))
+    (is (not (contains? (rules (merge clean {:op :record/write :record-id "r" :kind :soap-note
+                                             :public-meta {:patient-did "did:plc:patient-a"
+                                                           :occurred-at now}}))
+                        :public-meta-not-allowlisted))
+        "a public-meta entirely inside the allowlist must pass")))
+
+(deftest all-hard-rules-are-exercised
+  (testing "`gov/all-hard-rules` is the set this suite actually provokes.
+            A rule added to a check but not demonstrated here, or listed
+            but unreachable, fails this test rather than sitting unseen."
+    (let [demonstrated (into #{} (map :rule) cases)]
+      (is (= gov/all-hard-rules demonstrated)
+          (str "listed but never demonstrated: "
+               (vec (sort (set/difference gov/all-hard-rules demonstrated)))
+               " / demonstrated but not listed: "
+               (vec (sort (set/difference demonstrated gov/all-hard-rules))))))))
+
+(deftest confidence-cannot-buy-a-hard-violation
+  (testing "the advisor's own certainty is not an input to a HARD check.
+            This is the property that makes the governor independent: an
+            LLM that is sure gets the same answer as one that is not."
+    (let [req (merge clean {:capability-uri "at://consent/cap-other-patient"})]
+      (doseq [c [0.0 0.5 0.95 1.0]]
+        (let [v (gov/check req ctx {:confidence c} st)]
+          (is (:hard? v) (str "confidence " c " must not clear a HARD violation"))
+          (is (false? (:ok? v)))
+          (is (contains? (into #{} (map :rule) (:violations v)) :consent-granter-mismatch)))))))
+
+(deftest a-clean-disclosure-still-escalates
+  (testing "no disclosure is ever `:ok?`, however clean -- PHI leaving
+            this actor is always a clinician's call"
+    (let [v (gov/check clean ctx {:confidence 1.0} st)]
+      (is (empty? (:violations v)))
+      (is (false? (:ok? v)))
+      (is (true? (:escalate? v)))
+      (is (true? (:high-stakes? v))))))
+
+(deftest a-clean-write-is-ok-without-a-human
+  (testing "the other direction: a write inside the allowlist is not
+            high-stakes and does not escalate, so `:ok?` is reachable"
+    (let [v (gov/check (merge clean {:op :record/write :record-id "r" :kind :soap-note
+                                     :public-meta {:patient-did "did:plc:patient-a"}})
+                       ctx {:confidence 0.95} st)]
+      (is (empty? (:violations v)))
+      (is (true? (:ok? v)))
+      (is (false? (:high-stakes? v))))))
+
+(deftest low-confidence-escalates-a-clean-write
+  (let [v (gov/check (merge clean {:op :record/write :record-id "r" :kind :soap-note
+                                   :public-meta {:patient-did "did:plc:patient-a"}})
+                     ctx {:confidence 0.1} st)]
+    (is (empty? (:violations v)) "low confidence is not a violation")
+    (is (false? (:ok? v)))
+    (is (true? (:escalate? v)) "it is a reason to ask a human")))
+
+(deftest the-consent-window-is-half-open
+  (testing "now == expires-at is expired, not valid. An interval whose
+            upper bound is inclusive gives away a whole extra instant,
+            and off-by-one at a boundary is exactly what nobody notices."
+    (is (contains? (rules (merge clean {:capability-uri "at://consent/cap-expired"
+                                        :scope #{:soap-note}
+                                        :now "2025-06-01T00:00:00Z"}))
+                   :consent-expired))
+    (is (not (contains? (rules (merge clean {:capability-uri "at://consent/cap-expired"
+                                             :scope #{:soap-note}
+                                             :now "2025-05-31T23:59:59Z"}))
+                        :consent-expired))
+        "one second earlier is still valid")))
+
+(deftest a-malformed-instant-is-refused-not-compared
+  (testing "lexicographic comparison is only correct for the fixed-width
+            UTC shape. `2026-6-1` sorts BEFORE `2026-02-01T00:00:00Z`,
+            so comparing it would make an expired consent look live --
+            the check must refuse to answer instead."
+    (is (false? (gov/instant? "2026-6-1")))
+    (is (false? (gov/instant? "2026-06-01")))
+    (is (false? (gov/instant? "2026-06-01T00:00:00+09:00")))
+    (is (true?  (gov/instant? "2026-06-01T00:00:00Z")))
+    (is (true?  (gov/instant? "2026-06-01T00:00:00.123Z")))
+    (is (contains? (rules (merge clean {:now "2026-6-1"})) :consent-window-unevaluable)
+        "and the refusal is its own named rule, not silence")))
+
+(deftest cross-border-with-an-explicit-safeguard-passes
+  (testing "the check is about the absence of a basis, not about the
+            border. Supply a safeguard and the same transfer clears."
+    (let [req (merge clean {:capability-uri "at://consent/cap-cross-border"
+                            :recipient-did "did:web:clinic-x.example"
+                            :scope #{:soap-note}})]
+      (is (contains? (rules req) :cross-border-without-basis))
+      (is (not (contains? (rules (assoc req :transfer-safeguard "SCC 2021/914 module 2"))
+                          :cross-border-without-basis))))))
+
+(deftest adequacy-does-not-imply-its-converse-for-uncatalogued-pairs
+  (testing "an uncatalogued jurisdiction is UNKNOWN in both directions"
+    (is (contains? (rules (merge clean {:capability-uri "at://consent/cap-uncatalogued"
+                                        :recipient-did "did:web:clinic-y.example"
+                                        :scope #{:soap-note}}))
+                   :legal-basis-missing))
+    (is (not (contains? (rules (merge clean {:capability-uri "at://consent/cap-uncatalogued"
+                                             :recipient-did "did:web:clinic-y.example"
+                                             :scope #{:soap-note}}))
+                        :cross-border-without-basis))
+        "a jurisdiction with no entry gets the missing-basis rule, not
+         the no-adequacy rule -- they are different findings and an
+         operator acts differently on each")))

@@ -1,0 +1,162 @@
+(ns karute.sim
+  "Demo driver -- `clojure -M:sim`. Walks a clean second-opinion
+  disclosure through escalation -> human approval -> commit, then walks
+  every HARD hold check in `karute.governor`, none of which ever reaches
+  a human, and prints the audit ledger.
+
+  ## This generator refuses to report a pass with zero refusals
+
+  `-main` exits NON-ZERO if the run produced no `:hold` entries, or if
+  the ledger chain does not verify, or if any check in
+  `karute.governor/all-hard-rules` was never exercised. A demo of a
+  governor that never refuses anything is a demo of nothing, and it
+  would look exactly like a successful run: same exit code, same
+  cheerful output. The floor makes the two distinguishable.
+
+  It also exits non-zero if the clean path FAILED to commit -- a
+  governor that refuses everything is as useless as one that refuses
+  nothing, and only checking one direction would hide that."
+  (:require [clojure.string :as str]
+            [karute.governor :as gov]
+            [karute.ledger :as ledger]
+            [karute.operation :as op]))
+
+(def clinician {:actor-id "dr-a" :actor-role :clinician :phase 3})
+(def now "2026-06-01T00:00:00Z")
+
+(def base
+  {:subject "did:plc:patient-a"
+   :recipient-did "did:web:clinic-b.example"
+   :now now
+   :home-jurisdiction "JPN"
+   :scope #{:soap-note :observation :condition}
+   :confidence 0.95})
+
+(defn- disclose [st req]
+  (op/run st (merge base {:op :disclosure/second-opinion} req) clinician))
+
+(def ^:dynamic *verbose*
+  "`run-all` is called by `karute.sim-test` as well as by `-main`. It
+  prints only when the caller asked for a demo, so the test output stays
+  readable and the walk stays the same walk."
+  false)
+
+(defn- pad-right
+  "`format` is JVM-only and this file is `.cljc`; clj-kondo flags it as
+  an unresolved symbol for the ClojureScript branch. Padding by hand
+  keeps the demo runnable on both runtimes."
+  [s n]
+  (let [s (str s)]
+    (str s (apply str (repeat (max 0 (- n (count s))) " ")))))
+
+(defn- show! [label state]
+  (let [r (:result state)]
+    (when *verbose*
+      (println (str (pad-right label 58) " -> " (name (:disposition r)) " "
+                    (let [b (get-in r [:verdict :basis]
+                                    (mapv :rule (get-in r [:verdict :violations] [])))]
+                      (if (seq b) (str/join "," (map name b))
+                          (str "(" (name (or (:reason r) :ok)) ")"))))))
+    state))
+
+(defn run-all
+  "Returns the final state after the whole walk."
+  []
+  (let [s0 (op/initial-state)
+        ;; --- the clean path: escalates, a human approves, it commits ---
+        s1 (show! "[clean] second-opinion under cap-clean"
+                  (disclose s0 {:capability-uri "at://consent/cap-clean"}))
+        s2 (op/resume s1 (merge base {:op :disclosure/second-opinion
+                                      :capability-uri "at://consent/cap-clean"})
+                      clinician {:status :approved :by "dr-a"})
+        _  (when *verbose*
+             (println (str (pad-right "[clean] human approves" 58) " -> "
+                           (name (get-in s2 [:result :disposition])))))
+        ;; --- every HARD check, in order ---
+        s  (reduce
+            (fn [st [label req]] (show! label (disclose st req)))
+            s2
+            [["[1] no capability cited"            {:capability-uri nil}]
+             ["[2] capability URI not in store"    {:capability-uri "at://consent/nope"}]
+             ["[3] consent granted by ANOTHER patient" {:capability-uri "at://consent/cap-other-patient"}]
+             ["[4] consent granted to ANOTHER recipient" {:capability-uri "at://consent/cap-clean"
+                                                          :recipient-did "did:web:elsewhere.example"}]
+             ["[5] consent revoked"                {:capability-uri "at://consent/cap-revoked"
+                                                    :scope #{:soap-note}}]
+             ["[6] consent expired"                {:capability-uri "at://consent/cap-expired"
+                                                    :scope #{:soap-note}}]
+             ["[6c] consent not yet valid"         {:capability-uri "at://consent/cap-clean-2"
+                                                    :now "2025-12-01T00:00:00Z"}]
+             ["[6b] :now is not an ISO-8601 instant" {:capability-uri "at://consent/cap-clean-2"
+                                                      :now "2026-6-1"}]
+             ["[7] purpose bound to insurance-billing" {:op :disclosure/second-opinion
+                                                        :capability-uri "at://consent/cap-billing"
+                                                        :recipient-did "did:web:iryo.etzhayyim.com"
+                                                        :subject "did:plc:patient-a"
+                                                        :scope #{:encounter}}]
+             ["[8] scope exceeds consent"          {:capability-uri "at://consent/cap-expired"
+                                                    :now "2025-03-01T00:00:00Z"
+                                                    :scope #{:soap-note :medication-request}}]
+             ["[8b] scope names a kind that does not exist" {:capability-uri "at://consent/cap-clean-2"
+                                                             :scope #{:horoscope}}]
+             ["[8c] scope is empty"                {:capability-uri "at://consent/cap-clean-2"
+                                                    :scope #{}}]
+             ["[9] consent re-delegated too far"   {:capability-uri "at://consent/cap-deep-delegation"
+                                                    :scope #{:soap-note}}]
+             ["[10a] recipient jurisdiction not in the facts catalog" {:capability-uri "at://consent/cap-uncatalogued"
+                                                                       :recipient-did "did:web:clinic-y.example"
+                                                                       :scope #{:soap-note}}]
+             ["[10] cross-border with no basis"    {:capability-uri "at://consent/cap-cross-border"
+                                                    :recipient-did "did:web:clinic-x.example"
+                                                    :scope #{:soap-note}}]
+             ["[11] the SAME disclosure a second time" {:capability-uri "at://consent/cap-clean"}]])
+        ;; --- the write-side distinctive check ---
+        s' (show! "[12] public-meta carries a name and a diagnosis"
+                  (op/run s {:op :record/write :subject "did:plc:patient-a" :now now
+                             :record-id "rec-9" :kind :soap-note :encrypted-cid "bafy-9"
+                             :confidence 0.99
+                             :public-meta {:patient-did "did:plc:patient-a"
+                                           :name "山田 太郎"
+                                           :diagnosis "J18.9"}}
+                          clinician))]
+    (show! "[clean-write] public-meta within the allowlist"
+           (op/run s' {:op :record/write :subject "did:plc:patient-a" :now now
+                       :record-id "rec-10" :kind :soap-note :encrypted-cid "bafy-10"
+                       :confidence 0.99
+                       :public-meta {:patient-did "did:plc:patient-a"
+                                     :occurred-at now}}
+                   clinician))))
+
+(defn audit
+  "The floor. Returns {:ok? bool :problems [..] :summary ..}."
+  [state]
+  (let [l         (:ledger state)
+        s         (ledger/summary l)
+        exercised (into #{} (mapcat :basis) l)
+        unexercised (into (sorted-set) (remove exercised gov/all-hard-rules))
+        problems (cond-> []
+                   (zero? (:refused s))
+                   (conj "この実演は 1 件も拒否していない。拒否しない governor の実演は実演ではない")
+
+                   (zero? (:committed s))
+                   (conj "この実演は 1 件も commit していない。全部拒否する governor は全部通す governor と同じだけ役に立たない")
+
+                   (not (:ok? (:chain s)))
+                   (conj (str "監査台帳のチェーンが壊れている: " (pr-str (:chain s))))
+
+                   (seq unexercised)
+                   (conj (str "一度も発火しなかった HARD check: " (vec unexercised))))]
+    {:ok? (empty? problems) :problems problems :summary s}))
+
+(defn -main [& _]
+  (println "== karute governor demo ==")
+  (let [state (binding [*verbose* true] (run-all))
+        {:keys [ok? problems summary]} (audit state)]
+    (println)
+    (println "ledger:" (pr-str summary))
+    (if ok?
+      (println "OK — 拒否" (:refused summary) "件 / commit" (:committed summary) "件 / chain verified")
+      (do (println "REFUSING TO REPORT A PASS:")
+          (doseq [p problems] (println "  -" p))))
+    #?(:clj (System/exit (if ok? 0 1))
+       :cljs (set! (.-exitCode js/process) (if ok? 0 1)))))
