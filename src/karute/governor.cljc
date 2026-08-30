@@ -1,0 +1,311 @@
+(ns karute.governor
+  "KaruteGovernor -- the independent compliance layer that earns the
+  Karute-LLM the right to disclose. The LLM has no notion of whether the
+  consent it is holding was granted by THIS patient, to THIS recipient,
+  for THIS purpose, is still unrevoked and unexpired, covers the record
+  kinds actually being sent, is delegated no further than the patient
+  allowed, or crosses a border into a jurisdiction this actor has a
+  legal basis for -- so this MUST be a separate system able to *reject*
+  a proposal and fall back to HOLD.
+
+  `manifest.edn` already DECLARES all of this. Its `requestIryoBilling`
+  pipeline carries the consent test as a Cypher `WHERE` clause
+  (granter = patient AND grantee = iryo AND purpose = 'insurance-billing'
+  AND status = 'active' AND expiresAt > now), and its `:governance` block
+  states the PHI policy in prose. A `WHERE` clause is a filter inside one
+  query: it decides which rows come back, not whether the operation was
+  permitted, and nothing re-checks it for the OTHER pipelines. This
+  namespace is that declaration made executable and, more to the point,
+  made refusable -- `exportFhirBundle`, the pipeline that discloses the
+  most PHI (a patient's entire timeline, decrypted to a recipient DID),
+  has no consent test in the manifest at all.
+
+  ## The eleven HARD checks on a disclosure
+
+  ALL HARD violations: a human approver CANNOT override them.
+
+    1.  `consent-missing-violations`          -- no capability cited at all.
+    2.  `consent-not-found-violations`        -- the cited URI is not in the store. Absence of a capability is absence of consent, never a permissive default.
+    3.  `consent-granter-mismatch-violations` -- the capability was granted by someone other than the patient whose records are being disclosed. This is the confused-deputy case: a perfectly valid consent from patient B used to export patient A.
+    4.  `consent-grantee-mismatch-violations` -- the capability was granted to someone other than the recipient being sent to.
+    5.  `consent-revoked-violations`          -- status is `:revoked`.
+    6.  `consent-window-violations`           -- now is outside [issued-at, expires-at), or either bound is not a well-formed instant. A malformed bound is a violation in its own right, NOT a comparison silently made against garbage.
+    7.  `purpose-not-bound-violations`        -- the operation's purpose is not the capability's purpose (個人情報保護法 第18条, 利用目的による制限).
+    8.  `scope-exceeds-consent-violations`    -- a requested record kind is outside the capability's scope, or is not a kind this actor holds at all (45 CFR §164.502(b), minimum necessary).
+    9.  `delegation-depth-violations`         -- the capability has been re-delegated further than `max-delegation-depth`.
+    10. `cross-border-violations`             -- the recipient's jurisdiction has no entry in `karute.facts/catalog`, or the transfer has neither a standing adequacy basis nor its own `:transfer-safeguard` (個人情報保護法 第28条).
+    11. `double-disclosure-violations`        -- this exact (op, subject, recipient, capability) disclosure has already been performed, per `karute.store/disclosure-performed?`.
+
+  ## The HARD check on a write
+
+    12. `public-meta-not-allowlisted-violations` -- **this actor's own
+        DISTINCTIVE check**, per this fleet's convention that every actor
+        names its own novel contribution. `manifest.edn` states that
+        plaintext on the public graph is prohibited for patient-identifying
+        data, and then every write pipeline in that same file hands a
+        `publicMeta` map straight to `graph.write`. Nothing stood between
+        the two. This check refuses any key not in
+        `karute.store/public-meta-allowlist` -- a CLOSED set, so a field
+        added to a lexicon next year is refused until someone publishes it
+        on purpose. See that var's docstring for why a blocklist could not
+        do this job.
+
+  ## The soft gate
+
+  Confidence below `confidence-floor`, or any disclosure at all, ESCALATES
+  to a human. Every `:disclosure/*` op is high-stakes: PHI leaving this
+  actor is always a clinician's call. `karute.phase` enforces the same
+  invariant independently -- no phase, including the last, puts a
+  disclosure op in its `:auto` set. Two layers agree."
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [karute.facts :as facts]
+            [karute.store :as store]))
+
+(def confidence-floor
+  "Below this, a clean proposal still escalates to a human."
+  0.7)
+
+(def max-delegation-depth
+  "How many times a consent may be re-delegated before this actor stops
+  believing the chain represents the patient's intent. Two hops: the
+  grantee, and one onward referral."
+  2)
+
+(def disclosure-ops
+  "Operations that move PHI out of this actor. Every one is high-stakes."
+  #{:disclosure/export-bundle :disclosure/billing-forward :disclosure/second-opinion})
+
+(def write-ops #{:record/write})
+
+(def op-purpose
+  "The purpose each disclosure op asserts. A capability must be bound to
+  exactly this purpose for the op to proceed -- the op cannot pick its
+  own purpose out of the request, or purpose-binding would mean nothing."
+  {:disclosure/export-bundle   :portability
+   :disclosure/billing-forward :insurance-billing
+   :disclosure/second-opinion  :second-opinion})
+
+;; ------------------------------------------------------- instants
+
+(def ^:private instant-re #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+(defn instant?
+  "Well-formed UTC ISO-8601 instant. This actor compares instants
+  LEXICOGRAPHICALLY, which is correct only for this exact shape -- fixed
+  width, zero padded, `Z` suffix. Anything else is refused rather than
+  compared, because `\"2026-3-1\"` sorts before `\"2026-02-01T00:00:00Z\"`
+  and would silently make an expired consent look live."
+  [s]
+  (boolean (and (string? s) (re-matches instant-re s))))
+
+;; ------------------------------------------------------ the checks
+
+(defn- cap-of [request st] (store/capability st (:capability-uri request)))
+
+(defn consent-missing-violations [request _st]
+  (when (and (disclosure-ops (:op request))
+             (str/blank? (str (:capability-uri request))))
+    [{:rule :consent-missing
+      :detail "no consent capability was cited for a disclosure"}]))
+
+(defn consent-not-found-violations [request st]
+  (let [uri (:capability-uri request)]
+    (when (and (disclosure-ops (:op request))
+               (not (str/blank? (str uri)))
+               (nil? (cap-of request st)))
+      [{:rule :consent-not-found
+        :detail (str uri " は consent store に存在しない")}])))
+
+(defn consent-granter-mismatch-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (when (not= (:granter-did cap) (:subject request))
+      [{:rule :consent-granter-mismatch
+        :detail (str "consent は " (:granter-did cap) " が付与したものであり、"
+                     "開示対象の患者 " (:subject request) " のものではない")}])))
+
+(defn consent-grantee-mismatch-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (when (not= (:grantee-did cap) (:recipient-did request))
+      [{:rule :consent-grantee-mismatch
+        :detail (str "consent の grantee は " (:grantee-did cap)
+                     " であり、送信先 " (:recipient-did request) " ではない")}])))
+
+(defn consent-revoked-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (when (= :revoked (:status cap))
+      [{:rule :consent-revoked
+        :detail (str (:capability-uri cap) " は "
+                     (:revoked-at cap) " に撤回されている ("
+                     (:revocation-reason cap) ")")}])))
+
+(defn consent-window-violations
+  "now must lie in [issued-at, expires-at). A bound that is not a
+  well-formed instant is its own violation -- see `instant?`."
+  [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (let [now (:now request)
+          iss (:issued-at cap)
+          exp (:expires-at cap)]
+      (cond
+        (not (instant? now))
+        [{:rule :consent-window-unevaluable
+          :detail (str "request の :now が ISO-8601 UTC ではない: " (pr-str now))}]
+
+        (not (and (instant? iss) (instant? exp)))
+        [{:rule :consent-window-unevaluable
+          :detail (str "capability の有効期間が ISO-8601 UTC ではない: "
+                       (pr-str iss) " .. " (pr-str exp))}]
+
+        (< 0 (compare now exp))
+        [{:rule :consent-expired
+          :detail (str "consent は " exp " に失効している (now=" now ")")}]
+
+        (= 0 (compare now exp))
+        [{:rule :consent-expired
+          :detail (str "consent は " exp " ちょうどに失効する。有効区間は半開 [issued, expires) (now=" now ")")}]
+
+        (< (compare now iss) 0)
+        [{:rule :consent-not-yet-valid
+          :detail (str "consent は " iss " から有効 (now=" now ")")}]))))
+
+(defn purpose-not-bound-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (let [want (op-purpose (:op request))]
+      (when (not= want (:purpose cap))
+        [{:rule :purpose-not-bound
+          :detail (str "この操作の目的は " want " だが、consent は "
+                       (:purpose cap) " に限定されている (個人情報保護法 第18条)")}]))))
+
+(defn scope-exceeds-consent-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (let [want    (set (:scope request))
+          granted (set (:scope cap))
+          unknown (set/difference want store/record-kinds)
+          beyond  (set/difference want granted unknown)]
+      (cond-> []
+        (seq unknown)
+        (conj {:rule :scope-unknown-kind
+               :detail (str "この actor が保持しない record kind: " (vec (sort unknown)))})
+        (seq beyond)
+        (conj {:rule :scope-exceeds-consent
+               :detail (str "consent の範囲外の record kind: " (vec (sort beyond))
+                            " (許諾範囲 " (vec (sort granted)) ")")})
+        (empty? want)
+        (conj {:rule :scope-empty
+               :detail "開示要求に scope が無い。最小限の原則は空の要求では満たせない"})))))
+
+(defn delegation-depth-violations [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (let [d (count (:delegation-path cap []))]
+      (when (> d max-delegation-depth)
+        [{:rule :delegation-depth-exceeded
+          :detail (str "consent は " d " 回再委譲されている (上限 "
+                       max-delegation-depth ")")}]))))
+
+(defn cross-border-violations
+  "The recipient's jurisdiction must be in `karute.facts/catalog`, and
+  the transfer must either have a standing adequacy basis or carry its
+  own `:transfer-safeguard`."
+  [request st]
+  (when-let [cap (and (disclosure-ops (:op request)) (cap-of request st))]
+    (let [from (:home-jurisdiction request "JPN")
+          to   (:recipient-jurisdiction cap)]
+      (cond
+        (nil? (facts/basis-for to))
+        [{:rule :legal-basis-missing
+          :detail (str "受領者の法域 " (pr-str to)
+                       " は karute.facts/catalog に無い。未収載は「許可」ではなく UNKNOWN")}]
+
+        (and (not (facts/adequate? from to))
+             (str/blank? (str (:transfer-safeguard request))))
+        [{:rule :cross-border-without-basis
+          :detail (str from " -> " to
+                       " に standing な十分性の基礎が無く、:transfer-safeguard も無い"
+                       " (個人情報保護法 第28条)")}]))))
+
+(defn double-disclosure-violations [request st]
+  (when (disclosure-ops (:op request))
+    (when (store/disclosure-performed? st (:op request) (:subject request)
+                                       (:recipient-did request)
+                                       (:capability-uri request))
+      [{:rule :double-disclosure
+        :detail (str "この開示は既に実行済み: " (:op request) " / "
+                     (:subject request) " -> " (:recipient-did request))}])))
+
+(defn public-meta-not-allowlisted-violations
+  "This actor's distinctive check -- see the namespace docstring."
+  [request _st]
+  (when (write-ops (:op request))
+    (let [bad (store/public-meta-violations (:public-meta request))]
+      (when (seq bad)
+        [{:rule :public-meta-not-allowlisted
+          :detail (str "public-meta に許可されていないキー: " bad
+                       "。暗号化エンベロープの外に出せるのは "
+                       (vec (sort store/public-meta-allowlist)) " のみ")}]))))
+
+(def all-hard-rules
+  "Every HARD rule keyword this governor can emit. Not documentation:
+  `karute.sim/audit` refuses to report a pass unless the demo made every
+  one of these fire at least once, and `karute.governor-test` asserts
+  this set equals the set the tests actually provoke. A rule added to a
+  check but not to this set is a rule nothing ever demonstrates."
+  #{:consent-missing
+    :consent-not-found
+    :consent-granter-mismatch
+    :consent-grantee-mismatch
+    :consent-revoked
+    :consent-window-unevaluable
+    :consent-expired
+    :consent-not-yet-valid
+    :purpose-not-bound
+    :scope-unknown-kind
+    :scope-exceeds-consent
+    :scope-empty
+    :delegation-depth-exceeded
+    :legal-basis-missing
+    :cross-border-without-basis
+    :double-disclosure
+    :public-meta-not-allowlisted})
+
+;; ----------------------------------------------------- aggregation
+
+(defn check
+  "Censors a Karute-LLM proposal against the governor rules. Returns
+  {:ok? bool :violations [..] :confidence c :escalate? bool
+   :high-stakes? bool :hard? bool}."
+  [request _context proposal st]
+  (let [violation-lists [(consent-missing-violations request st)
+                         (consent-not-found-violations request st)
+                         (consent-granter-mismatch-violations request st)
+                         (consent-grantee-mismatch-violations request st)
+                         (consent-revoked-violations request st)
+                         (consent-window-violations request st)
+                         (purpose-not-bound-violations request st)
+                         (scope-exceeds-consent-violations request st)
+                         (delegation-depth-violations request st)
+                         (cross-border-violations request st)
+                         (double-disclosure-violations request st)
+                         (public-meta-not-allowlisted-violations request st)]
+        hard    (into [] (apply concat violation-lists))
+        conf    (:confidence proposal 0.0)
+        stakes? (boolean (disclosure-ops (:op request)))]
+    {:ok?          (and (empty? hard) (>= conf confidence-floor) (not stakes?))
+     :violations   hard
+     :confidence   conf
+     :hard?        (boolean (seq hard))
+     :escalate?    (and (empty? hard) (or (< conf confidence-floor) stakes?))
+     :high-stakes? stakes?}))
+
+(defn hold-fact
+  "The audit fact written when a proposal is rejected (HOLD)."
+  [request context verdict]
+  {:t           :governor-hold
+   :op          (:op request)
+   :actor       (:actor-id context)
+   :subject     (:subject request)
+   :recipient   (:recipient-did request)
+   :disposition :hold
+   :basis       (mapv :rule (:violations verdict))
+   :violations  (:violations verdict)
+   :confidence  (:confidence verdict)})

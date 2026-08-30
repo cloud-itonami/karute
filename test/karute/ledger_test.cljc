@@ -1,0 +1,83 @@
+(ns karute.ledger-test
+  "The audit chain must be able to say that it was edited. A log that
+  cannot is indistinguishable from one that was not."
+  (:require [clojure.test :refer [deftest is testing]]
+            [karute.ledger :as ledger]))
+
+(def facts
+  [{:t :decision :op :disclosure/second-opinion :disposition :hold  :basis [:consent-revoked]}
+   {:t :decision :op :disclosure/second-opinion :disposition :escalate :basis []}
+   {:t :decision :op :record/write              :disposition :commit :basis []}])
+
+(defn build [] (reduce ledger/append [] facts))
+
+(deftest an-unedited-chain-verifies
+  (let [l (build)]
+    (is (= 3 (count l)))
+    (is (= {:ok? true :length 3} (ledger/verify l)))
+    (is (= ledger/genesis-digest (:prev (first l))))
+    (is (= (:digest (first l)) (:prev (second l))))))
+
+(deftest editing-an-entry-is-detected-and-located
+  (testing "changing a hold into a commit -- the edit an actor would
+            most want to make -- breaks that entry's own digest"
+    (let [l       (build)
+          tampered (assoc-in l [0 :disposition] :commit)
+          v        (ledger/verify tampered)]
+      (is (false? (:ok? v)))
+      (is (= 0 (:broken-at v)))
+      (is (= :digest-mismatch (:reason v))))))
+
+(deftest removing-an-entry-is-detected
+  (testing "dropping the refusal in the middle leaves the survivors'
+            :prev pointing at an entry that is no longer there"
+    (let [l       (build)
+          removed (vec (concat [(nth l 0)] [(nth l 2)]))
+          v       (ledger/verify removed)]
+      (is (false? (:ok? v)))
+      (is (= 1 (:broken-at v)))
+      (is (contains? #{:prev-mismatch :seq-mismatch} (:reason v))))))
+
+(deftest truncating-the-tail-still-verifies-and-that-is-honest
+  (testing "a prefix of a valid chain IS a valid chain -- this hash
+            chain detects edits and removals from the middle, not
+            truncation of the end. Asserting the true property here
+            rather than a flattering one: truncation is what the
+            substrate's signed envelope and the remote audit actor are
+            for, not this."
+    (let [l (build)]
+      (is (:ok? (ledger/verify (vec (take 2 l))))))))
+
+(deftest reordering-is-detected
+  (let [l (build)
+        swapped (vec [(nth l 1) (nth l 0) (nth l 2)])]
+    (is (false? (:ok? (ledger/verify swapped))))))
+
+(deftest the-summary-counts-refusals-as-their-own-number
+  (testing "an actor that never refused anything must be visibly
+            distinguishable from one whose refusals were dropped"
+    (let [s (ledger/summary (build))]
+      (is (= 3 (:total s)))
+      (is (= 1 (:refused s)))
+      (is (= 1 (:committed s)))
+      (is (= 1 (:escalated s)))
+      (is (:ok? (:chain s))))))
+
+(deftest the-digest-does-not-depend-on-map-construction-order
+  (testing "two equal entries must digest identically however they were
+            built, or the chain would break on a value that never changed"
+    (let [a {:t :decision :op :record/write :disposition :commit}
+          b (into {} [[:disposition :commit] [:op :record/write] [:t :decision]])]
+      (is (= a b))
+      (is (= (ledger/entry-digest a) (ledger/entry-digest b))))))
+
+(deftest the-digest-is-stable-across-nesting
+  (let [a {:v [{:rule :consent-revoked :detail "x"}] :s #{:b :a}}
+        b {:s #{:a :b} :v [{:detail "x" :rule :consent-revoked}]}]
+    (is (= (ledger/entry-digest a) (ledger/entry-digest b)))))
+
+(deftest the-digest-changes-when-content-changes
+  (testing "the other direction -- a digest that never changes would
+            also pass every test above"
+    (is (not= (ledger/entry-digest {:disposition :hold})
+              (ledger/entry-digest {:disposition :commit})))))

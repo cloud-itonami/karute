@@ -1,0 +1,277 @@
+(ns karute.store
+  "The SSoT for the karute actor: consent capabilities, the public index
+  of encrypted clinical records, and the disclosures that have already
+  been performed.
+
+  A `db` is a plain map -- a VALUE, not an atom. Every function here is
+  pure: `apply-*` returns the next db rather than mutating one. The
+  append-only audit ledger is NOT stored here; it lives in
+  `karute.ledger`, which owns its own hash-chained representation.
+
+  ## What this store deliberately does NOT hold
+
+  No plaintext PHI, ever. A `:record` here is the PUBLIC half of a
+  `com.etzhayyim.encrypted.record` envelope (manifest.edn
+  `:governance/:phiPolicy`): a content id, an inner type, and a
+  `:public-meta` map. The ciphertext is addressed by `:encrypted-cid`
+  and is not readable from this process. That is why
+  `public-meta-allowlist` below is a CLOSED set and not a blocklist --
+  see its docstring.
+
+  ## The double-disclosure guard
+
+  `disclosure-performed?` is a DEDICATED set-membership guard over
+  `:disclosures`, never inferred from a record's own `:status` field. A
+  status is advisory and any node may set it; membership in the
+  disclosure log is a fact about what this actor actually did. The same
+  discipline as `commitledger.store/tranche-already-released?`."
+  (:require [clojure.set :as set]
+            [clojure.string :as str]))
+
+(def public-meta-allowlist
+  "The ONLY keys permitted in a record's `:public-meta`.
+
+  This is a closed allowlist rather than a blocklist of forbidden field
+  names, and the difference is the whole point: a blocklist answers
+  'is this one of the leaks I already thought of?', which is a question
+  that silently returns 'no' for every leak nobody has thought of yet.
+  A closed set answers 'was this key designed to be public?', and a new
+  field is refused until someone adds it here on purpose.
+
+  Every key below is one the actor's own pipelines in `manifest.edn`
+  actually write to the public graph. `:patient-did` is a pseudonymous
+  did:plc/did:web identifier and is architecturally required as the
+  graph join key -- it is public by design, unlike a name, an address,
+  a 保険証番号, a birth date, or any clinical content, none of which
+  have a key here and none of which can acquire one by accident."
+  #{:patient-did :encounter-did :occurred-at :author-did :prescriber-did
+    :status :loinc-code :medication-request-uri :pharmacy-did
+    :pharmacist-did :when-handed-over :substitution-performed})
+
+(def record-kinds
+  "Inner types this actor indexes, from `lex/`. Used to bound a
+  disclosure `:scope` -- a scope naming a kind that does not exist is a
+  scope nobody can have consented to."
+  #{:patient :encounter :soap-note :observation :condition
+    :medication-request :service-request :dispense-record
+    :care-plan :home-visit :homecare-episode})
+
+;; ----------------------------------------------------------------- db
+
+(def empty-db
+  {:capabilities {}   ; capability-uri -> capability map
+   :records      {}   ; record-id      -> public record map
+   :disclosures  #{}}) ; #{[op subject recipient-did capability-uri]}
+
+(defn put-capability
+  "Insert/replace a consent capability. Pure: returns the next db."
+  [db cap]
+  (assoc-in db [:capabilities (:capability-uri cap)] cap))
+
+(defn put-record
+  "Insert/replace the public half of an encrypted record."
+  [db rec]
+  (assoc-in db [:records (:record-id rec)] rec))
+
+(defn capability
+  "The capability for a URI, or nil. nil means NOT FOUND, which the
+  governor treats as absence of consent -- never as a permissive
+  default."
+  [db uri]
+  (when (and (string? uri) (not (str/blank? uri)))
+    (get-in db [:capabilities uri])))
+
+(defn record [db record-id] (get-in db [:records record-id]))
+
+(defn records-for-patient
+  [db patient-did]
+  (->> (vals (:records db))
+       (filter #(= patient-did (get-in % [:public-meta :patient-did])))
+       (sort-by :seq)
+       vec))
+
+(defn record-kinds-for-patient
+  "The set of inner types actually held for a patient. A disclosure
+  scope is checked against the CAPABILITY, not against this -- but
+  `karute.operation` reports it so an operator can see what a scope
+  would really reach."
+  [db patient-did]
+  (into #{} (map :kind) (records-for-patient db patient-did)))
+
+;; --------------------------------------------------- disclosure guard
+
+(defn disclosure-key [op subject recipient-did capability-uri]
+  [op subject recipient-did capability-uri])
+
+(defn disclosure-performed?
+  "Has this exact disclosure already been performed? A dedicated guard
+  over the disclosure log -- see this namespace's docstring for why
+  this is not read off a `:status`."
+  [db op subject recipient-did capability-uri]
+  (contains? (:disclosures db)
+             (disclosure-key op subject recipient-did capability-uri)))
+
+(defn record-disclosure
+  [db op subject recipient-did capability-uri]
+  (update db :disclosures conj
+          (disclosure-key op subject recipient-did capability-uri)))
+
+(defn revoke-capability
+  "Mark a capability revoked. Revocation is a status change and never a
+  deletion: an audit that cannot see a capability that once existed
+  cannot explain a disclosure that was made under it."
+  [db uri at reason]
+  (if (capability db uri)
+    (update-in db [:capabilities uri] assoc
+               :status :revoked :revoked-at at :revocation-reason reason)
+    db))
+
+;; -------------------------------------------------- public-meta check
+
+(defn public-meta-violations
+  "Keys present in `public-meta` that are NOT in `public-meta-allowlist`.
+  Returns a sorted vector (possibly empty) so the governor's report is
+  deterministic."
+  [public-meta]
+  (if (map? public-meta)
+    (vec (sort (set/difference (set (keys public-meta)) public-meta-allowlist)))
+    []))
+
+;; ------------------------------------------------------------- seed
+
+(defn seed-db
+  "The demo fixture `karute.sim` walks. Two patients, one clean
+  capability each, plus the capabilities each hold-check needs."
+  []
+  (-> empty-db
+      ;; --- patient A: a clean, active, purpose-bound export consent ---
+      (put-capability
+       {:capability-uri "at://consent/cap-clean"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note :observation :condition}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      (put-capability
+       {:capability-uri "at://consent/cap-expired"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note}
+        :status         :active
+        :issued-at      "2025-01-01T00:00:00Z"
+        :expires-at     "2025-06-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      (put-capability
+       {:capability-uri "at://consent/cap-revoked"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note}
+        :status         :revoked
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :revoked-at     "2026-03-01T00:00:00Z"
+        :revocation-reason "patient withdrew"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      ;; --- patient B's capability, used to try to export patient A ---
+      (put-capability
+       {:capability-uri "at://consent/cap-other-patient"
+        :granter-did    "did:plc:patient-b"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note :observation :condition}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      ;; --- billing consent, bound to the insurance purpose only ---
+      (put-capability
+       {:capability-uri "at://consent/cap-billing"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:iryo.etzhayyim.com"
+        :purpose        :insurance-billing
+        :scope          #{:encounter :service-request :medication-request}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      ;; --- a consent naming a recipient in an uncatalogued jurisdiction ---
+      (put-capability
+       {:capability-uri "at://consent/cap-cross-border"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-x.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "USA"})
+      ;; --- a consent naming a jurisdiction absent from karute.facts ---
+      (put-capability
+       {:capability-uri "at://consent/cap-uncatalogued"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-y.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        ;; BRA is a real jurisdiction with a real health-privacy regime
+        ;; (LGPD). It is absent from `karute.facts/catalog` because
+        ;; nobody has cited it here yet, and this actor treats absent as
+        ;; UNKNOWN rather than as permitted -- which is the whole point.
+        :recipient-jurisdiction "BRA"})
+      ;; --- a second identical clean consent, so that the demo cases which
+      ;;     only mean to trip ONE rule do not also trip double-disclosure ---
+      (put-capability
+       {:capability-uri "at://consent/cap-clean-2"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note :observation :condition}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path []
+        :recipient-jurisdiction "JPN"})
+      ;; --- a deeply re-delegated consent ---
+      (put-capability
+       {:capability-uri "at://consent/cap-deep-delegation"
+        :granter-did    "did:plc:patient-a"
+        :grantee-did    "did:web:clinic-b.example"
+        :purpose        :second-opinion
+        :scope          #{:soap-note}
+        :status         :active
+        :issued-at      "2026-01-01T00:00:00Z"
+        :expires-at     "2027-01-01T00:00:00Z"
+        :delegation-path ["did:web:a.example" "did:web:b.example" "did:web:c.example"]
+        :recipient-jurisdiction "JPN"})
+      (put-record {:record-id "rec-1" :kind :soap-note :seq 1
+                   :encrypted-cid "bafy-soap-1"
+                   :public-meta {:patient-did "did:plc:patient-a"
+                                 :encounter-did "did:plc:enc-1"
+                                 :occurred-at "2026-02-01T09:00:00Z"
+                                 :author-did "did:web:dr-a.example"}})
+      (put-record {:record-id "rec-2" :kind :observation :seq 2
+                   :encrypted-cid "bafy-obs-1"
+                   :public-meta {:patient-did "did:plc:patient-a"
+                                 :encounter-did "did:plc:enc-1"
+                                 :occurred-at "2026-02-01T09:10:00Z"
+                                 :loinc-code "8480-6"}})
+      (put-record {:record-id "rec-3" :kind :medication-request :seq 3
+                   :encrypted-cid "bafy-rx-1"
+                   :public-meta {:patient-did "did:plc:patient-a"
+                                 :encounter-did "did:plc:enc-1"
+                                 :prescriber-did "did:web:dr-a.example"
+                                 :status "active"}})))
