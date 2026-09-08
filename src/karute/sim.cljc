@@ -16,7 +16,7 @@
   It also exits non-zero if the clean path FAILED to commit -- a
   governor that refuses everything is as useless as one that refuses
   nothing, and only checking one direction would hide that."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [karute.governor :as gov]
             [karute.ledger :as ledger]
             [karute.operation :as op]))
