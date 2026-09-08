@@ -58,7 +58,7 @@
   invariant independently -- no phase, including the last, puts a
   disclosure op in its `:auto` set. Two layers agree."
   (:require [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [karute.facts :as facts]
             [karute.store :as store]))
 

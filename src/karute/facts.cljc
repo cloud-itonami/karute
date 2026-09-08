@@ -40,7 +40,7 @@
   医療情報 is 要配慮個人情報 (special-care-required personal information,
   同法 第2条第3項), which is why this actor has no 'implied consent'
   path at all: opt-out disclosure is unavailable for this category."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def catalog
   "iso3 -> legal basis map. `:legal-basis` / `:owner-authority` /
@@ -109,7 +109,7 @@
   the governor treats unknown as a hold -- never as permission."
   [iso3]
   (when (and (string? iso3) (not (str/blank? iso3)))
-    (get catalog (str/upper-case (str/trim iso3)))))
+    (get catalog (str/upper (str/trim iso3)))))
 
 (defn adequate?
   "True when `from` -> `to` has a standing cross-border basis in
@@ -118,8 +118,8 @@
   [from to]
   (boolean
    (and (string? from) (string? to)
-        (let [f (str/upper-case (str/trim from))
-              t (str/upper-case (str/trim to))]
+        (let [f (str/upper (str/trim from))
+              t (str/upper (str/trim to))]
           (or (= f t)
               (contains? (get adequacy f #{}) t))))))
 

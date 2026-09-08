@@ -26,7 +26,7 @@
   disclosure log is a fact about what this actor actually did. The same
   discipline as `commitledger.store/tranche-already-released?`."
   (:require [clojure.set :as set]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def public-meta-allowlist
   "The ONLY keys permitted in a record's `:public-meta`.
