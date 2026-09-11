@@ -1,4 +1,4 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (require '[babashka.classpath :as cp]
          '[babashka.fs :as fs]
          '[clojure.test :as t])
@@ -7,7 +7,7 @@
   (cp/add-classpath (str root "/test")))
 ;; Named explicitly, so adding a namespace under test/ without adding it
 ;; here means it does not run. That is a real hazard -- `cognitect.test-runner`
-;; (`clojure -M:test`) discovers by the `-test` suffix and therefore does NOT
+;; (`kbb -M:test`) discovers by the `-test` suffix and therefore does NOT
 ;; see `karute.methods.test-charter-gates`, while this list does. Neither
 ;; runner sees everything; both are kept in step by hand.
 (def suites '[karute.murakumo-test

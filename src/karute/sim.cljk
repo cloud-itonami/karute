@@ -1,5 +1,5 @@
 (ns karute.sim
-  "Demo driver -- `clojure -M:sim`. Walks a clean second-opinion
+  "Demo driver -- `kbb -M:sim`. Walks a clean second-opinion
   disclosure through escalation -> human approval -> commit, then walks
   every HARD hold check in `karute.governor`, none of which ever reaches
   a human, and prints the audit ledger.
