@@ -30,7 +30,7 @@ honest framing: できていないことは「未」と明記する。
 | 11 | iryo(レセプト)への hand-off boundary テスト(karute → iryo consent-capability) | 部分 | purpose 束縛は #12 で強制。iryo 側との実 hand-off は 未 |
 | 12 | **governed actor core** — 7部品 (facts/store/governor/phase/operation/ledger/sim) + 17 HARD check + 追記専用監査台帳 | ✅ | **iter 2026-08-31** |
 | 13 | consent capability の Ed25519 署名検証(#8 と対) — governor は現在 capability の**内容**のみ検査し、**署名**は検査しない | 未 | — |
-| 14 | `cognitect.test-runner` が `methods/test_charter_gates.cljc` を発見しない(ns 名が `-test` で終わらない)。`bb run_tests.cljk` のみが実行する | 未 | — |
+| 14 | `cognitect.test-runner` が `methods/test_charter_gates.cljc` を発見しない(ns 名が `-test` で終わらない)。`kbb run_tests.cljk` のみが実行する | 未 | — |
 
 ## イテレーション記録
 
@@ -57,7 +57,7 @@ consent 検査が manifest 上に**1 つも無かった**。
 | `karute.phase` | Phase 0→3 ロールアウト。`:disclosure/*` は**どの phase でも auto にならない** |
 | `karute.operation` | advise → govern → decide → record の 5 段。hold も escalate も db を変えない |
 | `karute.ledger` | 追記専用監査台帳。ハッシュ連鎖 + `verify` が改竄箇所を指す |
-| `karute.sim` | 実演器 `clojure -M:sim` |
+| `karute.sim` | 実演器 `kbb -M:sim` |
 
 **この actor 固有の check (#12 の distinctive)**: `public-meta-not-allowlisted`。
 `manifest.edn` は「患者識別情報を含むフィールドの MST 平文書き込みを禁止」と述べ、
@@ -68,16 +68,16 @@ consent 検査が manifest 上に**1 つも無かった**。
 「このキーは公開する設計だったか?」に答えるので、来年 lexicon に足されたフィールドは
 誰かが意図的にここへ足すまで拒否される。
 
-**実演器は 0 件拒否の実行を pass として報告しない。** `clojure -M:sim` は、拒否 0 件・
+**実演器は 0 件拒否の実行を pass として報告しない。** `kbb -M:sim` は、拒否 0 件・
 commit 0 件・台帳チェーン破損・`gov/all-hard-rules` のうち一度も発火しなかった check が
 あれば **exit 1** する。拒否しない governor の実演は実演ではなく、しかも成功した実行と
 まったく同じ顔(同じ exit code、同じ明るい出力)をする。
 
 **測定(2026-08-31、pin `aaae559` からの差分):**
 
-- `clojure -M:test` — before 9 tests / 356 assertions → after **71 / 571**
-- `bb run_tests.cljk` — before 13 / 391 → after **75 / 606**(charter gate 4/35 を含む)
-- `clojure -M:sim` — 無改変で exit 0、拒否 17 件 / commit 2 件 / chain verified
+- `kbb -M:test` — before 9 tests / 356 assertions → after **71 / 571**
+- `kbb run_tests.cljk` — before 13 / 391 → after **75 / 606**(charter gate 4/35 を含む)
+- `kbb -M:sim` — 無改変で exit 0、拒否 17 件 / commit 2 件 / chain verified
 - **床の判別性を実測**: governor の granter-mismatch check を 1 つ潰すと sim は exit 1 になり、
   `一度も発火しなかった HARD check: [:consent-granter-mismatch]` と、**潰したものと一致する名前**を
   報告した(escalate が 1→2 に増える —— 他患者の consent での開示が人間の承認待ち行列に
@@ -118,5 +118,5 @@ lexicons を cheshire で読み、charter が依存する**構造的不変条件
   recordedBy は DID フィールド(無名/自由記述の著者は表現不能)。
 - **closed clinical vocabularies** — encounter/observation/medicationRequest の status・class・
   category・intent は閉じた FHIR value set。
-`bb run_tests.cljk` が charter
+`kbb run_tests.cljk` が charter
 suite を実行するよう確認(actor reflex に wired)。ゲートは一切弱めず、assert のみ。
