@@ -22,7 +22,7 @@ honest framing: できていないことは「未」と明記する。
 | 3 | 11 FHIR Lexicons (`com.etzhayyim.karute.*` — patient/encounter/condition/observation/medicationRequest/serviceRequest/carePlan/dispenseRecord/soapNote/homecareEpisode/homeVisit) | ✅ | init |
 | 4 | did:web:karute.etzhayyim.com worker LIVE(`50-infra/karute-did-web`) | ✅ | init |
 | 5 | **charter-gate テスト** (`methods/test_charter_gates.cljc` — 4 tests / 35 assertions) | ✅ | **iter (this)** |
-| 6 | run_tests.clj が charter-gate suite を実行(actor reflex に wired) | ✅ | **iter (this)** |
+| 6 | run_tests.cljk が charter-gate suite を実行(actor reflex に wired) | ✅ | **iter (this)** |
 | 7 | encrypted-envelope 規律をスキーマ層で機械強制(`additionalProperties:false` + 平文 PHI フィールド拒否、R1) | 部分 | governor 層のみ (下記 #12)。lexicon の JSON schema 層は 未 |
 | 8 | consent.capability の Ed25519 検証テスト(member-signed / server-refused) | 未 | — |
 | 9 | 患者 DID = 30日 rotating pseudonym(ADR-2605181200)の構造検証 | 未 | — |
@@ -30,7 +30,7 @@ honest framing: できていないことは「未」と明記する。
 | 11 | iryo(レセプト)への hand-off boundary テスト(karute → iryo consent-capability) | 部分 | purpose 束縛は #12 で強制。iryo 側との実 hand-off は 未 |
 | 12 | **governed actor core** — 7部品 (facts/store/governor/phase/operation/ledger/sim) + 17 HARD check + 追記専用監査台帳 | ✅ | **iter 2026-08-31** |
 | 13 | consent capability の Ed25519 署名検証(#8 と対) — governor は現在 capability の**内容**のみ検査し、**署名**は検査しない | 未 | — |
-| 14 | `cognitect.test-runner` が `methods/test_charter_gates.cljc` を発見しない(ns 名が `-test` で終わらない)。`bb run_tests.clj` のみが実行する | 未 | — |
+| 14 | `cognitect.test-runner` が `methods/test_charter_gates.cljc` を発見しない(ns 名が `-test` で終わらない)。`bb run_tests.cljk` のみが実行する | 未 | — |
 
 ## イテレーション記録
 
@@ -76,7 +76,7 @@ commit 0 件・台帳チェーン破損・`gov/all-hard-rules` のうち一度�
 **測定(2026-08-31、pin `aaae559` からの差分):**
 
 - `clojure -M:test` — before 9 tests / 356 assertions → after **71 / 571**
-- `bb run_tests.clj` — before 13 / 391 → after **75 / 606**(charter gate 4/35 を含む)
+- `bb run_tests.cljk` — before 13 / 391 → after **75 / 606**(charter gate 4/35 を含む)
 - `clojure -M:sim` — 無改変で exit 0、拒否 17 件 / commit 2 件 / chain verified
 - **床の判別性を実測**: governor の granter-mismatch check を 1 つ潰すと sim は exit 1 になり、
   `一度も発火しなかった HARD check: [:consent-granter-mismatch]` と、**潰したものと一致する名前**を
@@ -118,5 +118,5 @@ lexicons を cheshire で読み、charter が依存する**構造的不変条件
   recordedBy は DID フィールド(無名/自由記述の著者は表現不能)。
 - **closed clinical vocabularies** — encounter/observation/medicationRequest の status・class・
   category・intent は閉じた FHIR value set。
-`bb run_tests.clj` が charter
+`bb run_tests.cljk` が charter
 suite を実行するよう確認(actor reflex に wired)。ゲートは一切弱めず、assert のみ。
