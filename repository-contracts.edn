@@ -16,4 +16,4 @@
                             "60-apps/etzhayyim-project-karute"
                             "10-protocol/lexicons-bundle"]}]
  :external-wire-formats #{:did-json :atproto-lexicon-json}
- :tests {:command ["bb" "run_tests.clj"]}}
+ :tests {:command ["bb" "run_tests.cljk"]}}
