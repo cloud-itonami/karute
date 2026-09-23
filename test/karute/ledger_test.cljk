@@ -1,7 +1,7 @@
 (ns karute.ledger-test
   "The audit chain must be able to say that it was edited. A log that
   cannot is indistinguishable from one that was not."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [karute.ledger :as ledger]))
 
 (def facts

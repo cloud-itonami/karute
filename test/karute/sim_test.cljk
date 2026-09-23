@@ -2,7 +2,7 @@
   "The demo's own floor. `karute.sim/audit` is what makes
   `kbb -M:sim` exit non-zero rather than print cheerfully, so it is
   itself something that has to be shown to discriminate."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [karute.governor :as gov]
             [karute.sim :as sim]))
 
