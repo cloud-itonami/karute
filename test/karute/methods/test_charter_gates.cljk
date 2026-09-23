@@ -24,7 +24,7 @@
   Touches neither the substrate-wide no-server-key (G7) nor Murakumo-only (G6) invariants —
   karute holds no key (consent is an Ed25519 member-signed capability, ADR-2605231400)."
   (:require [kotoba.test :refer [deftest is run-tests]]
-            [clojure.edn :as edn]))
+            [kotoba.lang.edn :as edn]))
 
 #?(:clj
    (do
