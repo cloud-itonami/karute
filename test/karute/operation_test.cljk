@@ -1,7 +1,7 @@
 (ns karute.operation-test
   "End to end: the advisor proposes, the governor decides, the phase
   gate decides again, and the ledger records all three dispositions."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [karute.ledger :as ledger]
             [karute.operation :as op]
             [karute.store :as store]))
