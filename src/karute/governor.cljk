@@ -57,7 +57,7 @@
   actor is always a clinician's call. `karute.phase` enforces the same
   invariant independently -- no phase, including the last, puts a
   disclosure op in its `:auto` set. Two layers agree."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as set]
             [kotoba.lang.text :as str]
             [karute.facts :as facts]
             [karute.store :as store]))

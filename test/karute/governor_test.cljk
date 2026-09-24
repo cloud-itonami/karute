@@ -13,7 +13,7 @@
      differing in the one field the rule is about. A check that fires on
      everything is as useless as one that fires on nothing, and only
      the pair can tell them apart."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as set]
             [kotoba.test :refer [deftest is testing]]
             [karute.governor :as gov]
             [karute.store :as store]))
