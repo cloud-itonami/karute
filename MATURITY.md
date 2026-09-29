@@ -18,7 +18,7 @@ honest framing: できていないことは「未」と明記する。
 | # | 項目 | 状態 | 完了イテレーション |
 |---|---|---|---|
 | 1 | ADR-2605231100 (EMR Phase 1) | ✅ | init |
-| 2 | actor.edn + actor.edn(deploy pipeline)+ CLAUDE.md + NOTICE | ✅ | init |
+| 2 | actor.edn + actor.edn(deploy pipeline)+ AGENTS.md + NOTICE | ✅ | init |
 | 3 | 11 FHIR Lexicons (`com.etzhayyim.karute.*` — patient/encounter/condition/observation/medicationRequest/serviceRequest/carePlan/dispenseRecord/soapNote/homecareEpisode/homeVisit) | ✅ | init |
 | 4 | did:web:karute.etzhayyim.com worker LIVE(`50-infra/karute-did-web`) | ✅ | init |
 | 5 | **charter-gate テスト** (`methods/test_charter_gates.cljc` — 4 tests / 35 assertions) | ✅ | **iter (this)** |
